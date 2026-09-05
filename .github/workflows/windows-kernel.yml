@@ -1,0 +1,122 @@
+name: Build Windows Kernel
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "版本号（可选，留空则自动根据 git tag 计算，如 1.14.0）"
+        required: false
+        type: string
+        default: ""
+  push:
+    branches:
+      - stable
+    tags:
+      - "v*"
+    paths-ignore:
+      - "**.md"
+      - ".github/workflows/build.yml"
+      - ".github/workflows/docker.yml"
+      - ".github/workflows/lint.yml"
+      - ".github/workflows/linux.yml"
+      - ".github/workflows/test.yml"
+      - ".github/workflows/stale.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build_windows:
+    name: Build Windows amd64 Kernel
+    runs-on: windows-latest
+
+    env:
+      # 已剔除: with_utls, with_acme, with_clash_api, with_ccm, with_ocm, with_naive_outbound, with_cloudflared, with_purego
+      TAGS: "with_gvisor,with_quic,with_dhcp,with_wireguard,with_tailscale,with_usbip,with_openvpn,with_openconnect,badlinkname,tfogo_checklinkname0"
+      GOOS: windows
+      GOARCH: amd64
+      CGO_ENABLED: "0"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ~1.26
+          cache: true
+
+      - name: Determine Version
+        id: version
+        shell: pwsh
+        run: |
+          $inputVersion = "${{ inputs.version }}".Trim()
+          if (-not [string]::IsNullOrEmpty($inputVersion)) {
+            $ver = $inputVersion.TrimStart('v')
+          } else {
+            try {
+              $ver = (go run ./cmd/internal/read_tag).Trim()
+            } catch {
+              $currentTag = $(git describe --tags --always 2>$null)
+              $ver = if ($currentTag) { $currentTag.TrimStart('v') } else { "custom" }
+            }
+          }
+          Write-Host "Calculated version: $ver"
+          "version=$ver" >> $env:GITHUB_OUTPUT
+          "VERSION=$ver" >> $env:GITHUB_ENV
+
+      - name: Build Windows Kernel
+        shell: pwsh
+        run: |
+          $LDFLAGS_SHARED = if (Test-Path release/LDFLAGS) { Get-Content release/LDFLAGS } else { "-checklinkname=0" }
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          
+          Write-Host "Building sing-box.exe with tags: $env:TAGS"
+          go build -v -trimpath -o dist/sing-box.exe `
+            -tags "$env:TAGS" `
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=$env:VERSION' $LDFLAGS_SHARED -s -w -buildid=" `
+            ./cmd/sing-box
+
+      - name: Package windows-amd64.zip
+        shell: pwsh
+        run: |
+          $DIR_NAME = "sing-box-$env:VERSION-windows-amd64"
+          $STAGE_DIR = "dist/$DIR_NAME"
+          New-Item -ItemType Directory -Force -Path $STAGE_DIR | Out-Null
+          
+          Copy-Item "dist/sing-box.exe" "$STAGE_DIR/"
+          if (Test-Path LICENSE) {
+            Copy-Item LICENSE "$STAGE_DIR/"
+          }
+          
+          # 生成指定的 windows-amd64.zip 及带版本号的归档包
+          Compress-Archive -Path "$STAGE_DIR/*" -DestinationPath "dist/windows-amd64.zip" -Force
+          Compress-Archive -Path "$STAGE_DIR/*" -DestinationPath "dist/$DIR_NAME.zip" -Force
+          
+          # 清理临时暂存目录与可执行文件
+          Remove-Item -Recurse -Force $STAGE_DIR
+          Remove-Item -Force "dist/sing-box.exe"
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-amd64
+          path: |
+            dist/windows-amd64.zip
+            dist/sing-box-*-windows-amd64.zip
+
+      - name: Publish Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create ${{ github.ref_name }} `
+            dist/windows-amd64.zip `
+            dist/sing-box-$env:VERSION-windows-amd64.zip `
+            --title "sing-box $env:VERSION" `
+            --notes "Windows amd64 kernel build (stripped tags)"
