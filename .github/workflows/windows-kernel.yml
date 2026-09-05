@@ -67,9 +67,13 @@ jobs:
         id: detect
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $false
+
           # 1. 拉取上游仓库 tags
           Write-Host "拉取上游仓库 tags..."
-          git remote add upstream https://github.com/SagerNet/sing-box.git 2>$null
+          if (-not (git remote | Select-String -Pattern "^upstream$")) {
+            git remote add upstream https://github.com/SagerNet/sing-box.git 2>$null
+          }
           git fetch upstream --tags 2>$null
 
           $targetTag = "${{ inputs.target_tag }}".Trim()
@@ -92,7 +96,7 @@ jobs:
 
             # 备用机制：遍历 tags 匹配纯版本号（如 v1.14.0，排除 v1.15.0-alpha.2 等带横杠的预发布版本）
             if (-not $detectedTag) {
-              $tagsJson = gh api repos/SagerNet/sing-box/tags --paginate=false | ConvertFrom-Json
+              $tagsJson = gh api repos/SagerNet/sing-box/tags --paginate=false 2>$null | ConvertFrom-Json
               $cleanTags = $tagsJson | Where-Object { $_.name -match '^v[0-9]+\.[0-9]+\.[0-9]+$' }
               if ($cleanTags) {
                 $detectedTag = $cleanTags[0].name
@@ -109,8 +113,11 @@ jobs:
           Write-Host "目标版本 Tag: $targetTag"
 
           # 3. 检查本仓库是否已经发布过此 Release
-          $existingRelease = gh release view $targetTag --repo ${{ github.repository }} 2>$null
-          $hasExisting = ($LASTEXITCODE -eq 0)
+          $hasExisting = $false
+          $releases = gh release list --repo ${{ github.repository }} --limit 100 --json tagName -q ".[].tagName" 2>$null
+          if ($releases) {
+            $hasExisting = ($releases -contains $targetTag)
+          }
 
           # 如果是定时检测触发且 Release 已存在，则安全跳过（避免每6小时重复编译发版）
           if ($hasExisting -and (-not $force) -and ("${{ github.event_name }}" -eq "schedule")) {
@@ -173,6 +180,7 @@ jobs:
         if: steps.detect.outputs.skip_build != 'true'
         shell: pwsh
         run: |
+          $PSNativeCommandUseErrorActionPreference = $false
           $tag = "${{ steps.detect.outputs.tag }}"
           $ver = "${{ steps.detect.outputs.version }}"
           Write-Host "推送标签 $tag 并创建 GitHub Release..."
@@ -184,6 +192,7 @@ jobs:
           gh release create $tag `
             dist/release/windows-amd64.zip `
             dist/release/sing-box-$tag-windows-amd64.zip `
+            --repo ${{ github.repository }} `
             --title "sing-box $tag" `
             --notes $notes `
             --clobber
