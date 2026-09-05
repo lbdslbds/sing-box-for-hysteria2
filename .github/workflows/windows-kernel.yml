@@ -188,13 +188,14 @@ jobs:
           # 将上游 tag 推送到本 fork 仓库
           git push origin "refs/tags/$tag" 2>$null
 
-          $notes = "### sing-box $tag (Windows amd64)`n- 同步上游纯净稳定版: $tag`n- 精简构建标记: 已剔除 with_utls, with_acme, with_clash_api, with_ccm, with_ocm, with_naive_outbound, with_cloudflared`n- 解压即用: 压缩包直接包含 sing-box.exe 与 LICENSE"
+          $notes = "### $ver (Windows amd64)`n- 同步上游纯净稳定版: $tag`n- 精简构建标记: 已剔除 with_utls, with_acme, with_clash_api, with_ccm, with_ocm, with_naive_outbound, with_cloudflared`n- 解压即用: 压缩包直接包含 sing-box.exe 与 LICENSE"
 
           $releases = gh release list --repo ${{ github.repository }} --limit 100 --json tagName -q ".[].tagName" 2>$null
           $hasExisting = ($releases -and ($releases -contains $tag))
 
           if ($hasExisting) {
-            Write-Host "Release $tag 已存在，上传并覆盖资产文件..."
+            Write-Host "Release $tag 已存在，更新标题为 $ver 并上传覆盖资产文件..."
+            gh release edit $tag --title "$ver" --repo ${{ github.repository }} 2>$null
             gh release upload $tag `
               dist/release/windows-amd64.zip `
               dist/release/sing-box-$tag-windows-amd64.zip `
@@ -206,6 +207,6 @@ jobs:
               dist/release/windows-amd64.zip `
               dist/release/sing-box-$tag-windows-amd64.zip `
               --repo ${{ github.repository }} `
-              --title "sing-box $tag" `
+              --title "$ver" `
               --notes $notes
           }
