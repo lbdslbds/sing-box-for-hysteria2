@@ -1,13 +1,21 @@
 name: Build Windows Kernel
 
 on:
+  schedule:
+    # 每 6 小时自动检测一次上游更新 (UTC 0:00, 6:00, 12:00, 18:00，对应北京时间 8:00, 14:00, 20:00, 02:00)
+    - cron: '0 */6 * * *'
   workflow_dispatch:
     inputs:
-      version:
-        description: "版本号（可选，留空则自动根据 git tag 计算，如 1.14.0）"
+      target_tag:
+        description: "指定版本Tag（留空则自动抓取上游最新纯净稳定版，如 v1.14.0）"
         required: false
         type: string
         default: ""
+      force_build:
+        description: "若该 Release 已存在，是否强制重新编译并覆盖发布"
+        required: false
+        type: boolean
+        default: false
   push:
     branches:
       - stable
@@ -26,6 +34,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: write
+
 jobs:
   build_windows:
     name: Build Windows amd64 Kernel
@@ -37,9 +48,11 @@ jobs:
       GOOS: windows
       GOARCH: amd64
       CGO_ENABLED: "0"
+      GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
@@ -50,40 +63,93 @@ jobs:
           go-version: ~1.26
           cache: true
 
-      - name: Determine Version
-        id: version
+      - name: Detect Upstream Release & Determine Tag
+        id: detect
         shell: pwsh
         run: |
-          $inputVersion = "${{ inputs.version }}".Trim()
-          if (-not [string]::IsNullOrEmpty($inputVersion)) {
-            $ver = $inputVersion.TrimStart('v')
-          } else {
+          # 1. 拉取上游仓库 tags
+          Write-Host "拉取上游仓库 tags..."
+          git remote add upstream https://github.com/SagerNet/sing-box.git 2>$null
+          git fetch upstream --tags 2>$null
+
+          $targetTag = "${{ inputs.target_tag }}".Trim()
+          $force = "${{ inputs.force_build }}" -eq "true"
+
+          # 2. 若未手动指定 tag，则自动检测上游最新纯净稳定版 (非 prerelease, 排除 -alpha, -beta, -rc 等后缀)
+          if ([string]::IsNullOrEmpty($targetTag)) {
+            Write-Host "检测上游 SagerNet/sing-box 最新稳定版..."
+            
+            # 优先从 releases/latest 获取 (GitHub 官方最新正式版)
+            $detectedTag = ""
             try {
-              $ver = (go run ./cmd/internal/read_tag).Trim()
+              $latestJson = gh api repos/SagerNet/sing-box/releases/latest 2>$null | ConvertFrom-Json
+              if ($latestJson -and ($latestJson.tag_name -match '^v?[0-9]+\.[0-9]+\.[0-9]+$')) {
+                $detectedTag = $latestJson.tag_name
+              }
             } catch {
-              $currentTag = $(git describe --tags --always 2>$null)
-              $ver = if ($currentTag) { $currentTag.TrimStart('v') } else { "custom" }
+              Write-Host "通过 releases/latest 获取失败，准备遍历 tags..."
             }
+
+            # 备用机制：遍历 tags 匹配纯版本号（如 v1.14.0，排除 v1.15.0-alpha.2 等带横杠的预发布版本）
+            if (-not $detectedTag) {
+              $tagsJson = gh api repos/SagerNet/sing-box/tags --paginate=false | ConvertFrom-Json
+              $cleanTags = $tagsJson | Where-Object { $_.name -match '^v[0-9]+\.[0-9]+\.[0-9]+$' }
+              if ($cleanTags) {
+                $detectedTag = $cleanTags[0].name
+              }
+            }
+
+            if (-not $detectedTag) {
+              Write-Error "未能检索到上游无后缀的纯净版本Tag！"
+              exit 1
+            }
+            $targetTag = $detectedTag
           }
-          Write-Host "Calculated version: $ver"
-          "version=$ver" >> $env:GITHUB_OUTPUT
-          "VERSION=$ver" >> $env:GITHUB_ENV
+
+          Write-Host "目标版本 Tag: $targetTag"
+
+          # 3. 检查本仓库是否已经发布过此 Release
+          $existingRelease = gh release view $targetTag --repo ${{ github.repository }} 2>$null
+          $hasExisting = ($LASTEXITCODE -eq 0)
+
+          # 如果是定时检测触发且 Release 已存在，则安全跳过（避免每6小时重复编译发版）
+          if ($hasExisting -and (-not $force) -and ("${{ github.event_name }}" -eq "schedule")) {
+            Write-Host "上游最新稳定版 $targetTag 对应 Release 已存在于本仓库，定时任务跳过。"
+            "skip_build=true" >> $env:GITHUB_OUTPUT
+            exit 0
+          }
+
+          "skip_build=false" >> $env:GITHUB_OUTPUT
+          "tag=$targetTag" >> $env:GITHUB_OUTPUT
+          "version=$($targetTag.TrimStart('v'))" >> $env:GITHUB_OUTPUT
+
+      - name: Checkout Target Tag
+        if: steps.detect.outputs.skip_build != 'true'
+        shell: pwsh
+        run: |
+          $tag = "${{ steps.detect.outputs.tag }}"
+          Write-Host "切换至代码标签 $tag..."
+          git checkout "refs/tags/$tag"
 
       - name: Build Windows Kernel
+        if: steps.detect.outputs.skip_build != 'true'
         shell: pwsh
         run: |
+          $ver = "${{ steps.detect.outputs.version }}"
           $LDFLAGS_SHARED = if (Test-Path release/LDFLAGS) { Get-Content release/LDFLAGS } else { "-checklinkname=0" }
           New-Item -ItemType Directory -Force -Path dist | Out-Null
           
-          Write-Host "Building sing-box.exe with tags: $env:TAGS"
+          Write-Host "正在编译 sing-box.exe (版本: $ver, Tags: $env:TAGS)..."
           go build -v -trimpath -o dist/sing-box.exe `
             -tags "$env:TAGS" `
-            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=$env:VERSION' $LDFLAGS_SHARED -s -w -buildid=" `
+            -ldflags "-X 'github.com/sagernet/sing-box/constant.Version=$ver' $LDFLAGS_SHARED -s -w -buildid=" `
             ./cmd/sing-box
 
-      - name: Prepare Package
+      - name: Prepare Packages
+        if: steps.detect.outputs.skip_build != 'true'
         shell: pwsh
         run: |
+          $tag = "${{ steps.detect.outputs.tag }}"
           $STAGE_DIR = "dist/package"
           New-Item -ItemType Directory -Force -Path $STAGE_DIR | Out-Null
           Copy-Item "dist/sing-box.exe" "$STAGE_DIR/"
@@ -91,23 +157,36 @@ jobs:
             Copy-Item LICENSE "$STAGE_DIR/"
           }
 
+          # 准备供 Release 上传的单层 zip 压缩包
+          New-Item -ItemType Directory -Force -Path dist/release | Out-Null
+          Compress-Archive -Path "$STAGE_DIR/*" -DestinationPath "dist/release/windows-amd64.zip" -Force
+          Compress-Archive -Path "$STAGE_DIR/*" -DestinationPath "dist/release/sing-box-$tag-windows-amd64.zip" -Force
+
       - name: Upload Artifact
+        if: steps.detect.outputs.skip_build != 'true'
         uses: actions/upload-artifact@v7
         with:
           name: windows-amd64
           path: dist/package/*
 
-      - name: Publish Release (on tag)
-        if: startsWith(github.ref, 'refs/tags/v')
+      - name: Publish GitHub Release
+        if: steps.detect.outputs.skip_build != 'true'
         shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          New-Item -ItemType Directory -Force -Path release | Out-Null
-          Compress-Archive -Path "dist/package/*" -DestinationPath "release/windows-amd64.zip" -Force
-          Compress-Archive -Path "dist/package/*" -DestinationPath "release/sing-box-$env:VERSION-windows-amd64.zip" -Force
-          gh release create ${{ github.ref_name }} `
-            release/windows-amd64.zip `
-            release/sing-box-$env:VERSION-windows-amd64.zip `
-            --title "sing-box $env:VERSION" `
-            --notes "Windows amd64 kernel build (stripped tags)"
+          $tag = "${{ steps.detect.outputs.tag }}"
+          $ver = "${{ steps.detect.outputs.version }}"
+          Write-Host "推送标签 $tag 并创建 GitHub Release..."
+          
+          # 将上游 tag 推送到本 fork 仓库
+          git push origin "refs/tags/$tag" 2>$null
+
+          # 创建 Release 并上传内核压缩包
+          gh release create $tag `
+            dist/release/windows-amd64.zip `
+            dist/release/sing-box-$tag-windows-amd64.zip `
+            --title "sing-box $tag" `
+            --notes "### sing-box $tag (Windows amd64)
+- 同步上游纯净稳定版: **$tag**
+- 精简构建标记: 已剔除 \`with_utls\`, \`with_acme\`, \`with_clash_api\`, \`with_ccm\`, \`with_ocm\`, \`with_naive_outbound\`, \`with_cloudflared\`
+- 解压即用: 压缩包直接包含 \`sing-box.exe\` 与 \`LICENSE\`" `
+            --clobber
