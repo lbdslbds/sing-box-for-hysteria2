@@ -147,14 +147,10 @@ jobs:
             git fetch upstream stable 2>$null
             git merge upstream/stable --no-edit -m "chore: sync upstream stable into stable"
             
-            Write-Host "将更新后的 stable 分支推送到本仓库..."
-            # 使用 GITHUB_TOKEN 显式设置推送 URL，确保认证有效
-            git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
-            git push origin stable
-            if ($LASTEXITCODE -ne 0) {
-              Write-Error "git push origin stable 失败，退出码: $LASTEXITCODE"
-              exit $LASTEXITCODE
-            }
+            # 注意：不再将 merge 结果 push 回仓库
+            # 原因：GITHUB_TOKEN 没有 workflows 权限，上游 merge 若包含 .github/workflows/ 的变更会被 GitHub 拒绝
+            # 此处本地 merge 仅用于编译，Release 步骤会独立推送 tag 和产物
+            Write-Host "本地 merge 完成（仅用于编译，不 push 回仓库）。"
           } else {
             $tag = "${{ steps.detect.outputs.tag }}"
             Write-Host "手动指定了版本标签，切换至代码标签 $tag..."
