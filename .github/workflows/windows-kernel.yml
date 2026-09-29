@@ -148,12 +148,19 @@ jobs:
             git merge upstream/stable --no-edit -m "chore: sync upstream stable into stable"
             
             Write-Host "将更新后的 stable 分支推送到本仓库..."
-            git push origin stable 2>$null
+            # 使用 GITHUB_TOKEN 显式设置推送 URL，确保认证有效
+            git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
+            git push origin stable
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "git push origin stable 失败，退出码: $LASTEXITCODE"
+              exit $LASTEXITCODE
+            }
           } else {
             $tag = "${{ steps.detect.outputs.tag }}"
             Write-Host "手动指定了版本标签，切换至代码标签 $tag..."
             git checkout "refs/tags/$tag"
           }
+          Write-Host "Merge Upstream 步骤完成。"
 
       - name: Build Windows Kernel
         if: steps.detect.outputs.skip_build != 'true'
@@ -203,8 +210,9 @@ jobs:
           Write-Host "推送标签 $tag 并创建/更新 GitHub Release..."
           
           # 将当前编译的提交打上 tag 并推送到本 fork 仓库
+          git remote set-url origin "https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git"
           git tag -f $tag
-          git push origin "refs/tags/$tag" --force 2>$null
+          git push origin "refs/tags/$tag" --force
 
           $notes = "### $ver (Windows amd64)`n- 同步上游纯净稳定版: $tag`n- 精简构建标记: 已剔除 with_utls, with_acme, with_clash_api, with_ccm, with_ocm, with_naive_outbound, with_cloudflared`n- 解压即用: 压缩包直接包含 sing-box.exe 与 LICENSE"
 
